@@ -70,11 +70,15 @@ import threading
 import time
 
 import msgpack
+import msgpack_numpy as msgpack_np
 import numpy as np
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 _REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_XR_ROOT    = os.path.expanduser("~/binliu/xr_teleoperate")
+_XR_ROOT    = os.environ.get(
+    "XR_TELEOPERATE_ROOT",
+    os.path.expanduser("~/workspace/xr_teleoperate"),
+)
 _SHARPA_SDK = os.environ.get("SHARPA_SDK_PATH", "/usr/lib/sharpa-wave-sdk/python")
 
 for p in [_REPO_ROOT, _XR_ROOT]:
@@ -110,7 +114,9 @@ def _np_decode(obj):
     if b"__ndarray_class__" in obj or "__ndarray_class__" in obj:
         key = b"as_npy" if b"as_npy" in obj else "as_npy"
         return np.load(io.BytesIO(obj[key]), allow_pickle=False)
-    return obj
+    # Isaac-GR00T's current PolicyServer encodes arrays with msgpack-numpy.
+    # Keep accepting the legacy np.save envelope above for compatibility.
+    return msgpack_np.decode(obj)
 
 
 class GR00TClient:
@@ -490,8 +496,17 @@ def _go_to_init_state(arm_ctrl, left_hand, right_hand, init_state: dict, hold_s:
 # ── camera client factory ────────────────────────────────────────────────────
 
 def _make_image_client(args):
-    """Build a camera client (ROS or ZMQ) and return (client, cam_config)."""
-    if args.image_source == "ros":
+    """Build a camera client and return (client, cam_config)."""
+    if args.image_source == "dds":
+        from teleop.utils.dds_image_client import DDSImageClient
+        client = DDSImageClient(
+            domain_id=args.camera_dds_domain,
+            network_interface=args.camera_network_interface,
+            warmup_timeout=args.cam_warmup_s,
+        )
+        cam_config = client.get_cam_config()
+        logger.info(f"Camera client: native CycloneDDS domain {args.camera_dds_domain}")
+    elif args.image_source == "ros":
         from teleop.utils.ros_image_client import ROSImageClient
         client = ROSImageClient(warmup_timeout=args.cam_warmup_s)
         cam_config = client.get_cam_config()
@@ -590,7 +605,7 @@ def get_observations(img_client, arm_ctrl, left_hand, right_hand,
     """Build the nested GR00T observation dict (before adding batch/time dims)."""
     video: dict[str, np.ndarray] = {}
 
-    if image_source == "ros":
+    if image_source in ("dds", "ros"):
         head_frame  = img_client.get_head_frame()
         l_wrist     = img_client.get_left_wrist_frame()
         r_wrist     = img_client.get_right_wrist_frame()
@@ -670,7 +685,7 @@ def check_observations(args):
 
     # DDS factory: needed for arm and for DDS-bridge hand client.
     need_dds = args.arm or (args.hands and args.hands_source == "dds") \
-        or args.image_source == "ros"  # ROSImageClient uses CycloneDDS too
+        or args.image_source in ("dds", "ros")
     if args.arm or (args.hands and args.hands_source == "dds"):
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         ChannelFactoryInitialize(args.dds_domain)
@@ -1106,11 +1121,15 @@ def parse_args():
     g.add_argument("--arm",      dest="arm",   action="store_true",  default=True)
     g.add_argument("--no-arm",   dest="arm",   action="store_false")
 
-    # Image source: ROS 2 (default, four CycloneDDS topics) or legacy ZMQ teleimager.
-    ap.add_argument("--image-source", choices=["ros", "zmq"], default="ros",
-                    help="Camera source. 'ros' = 4 sensor_msgs/Image topics published by "
-                         "sensing_h2_ros_gstreamer; 'zmq' = legacy teleimager server. "
-                         "Default: ros.")
+    # Image source: native DDS (default), ROS 2, or legacy ZMQ teleimager.
+    ap.add_argument("--image-source", choices=["dds", "ros", "zmq"], default="dds",
+                    help="Camera source. 'dds' = native JPEG topics from Thor; "
+                         "'ros' = sensor_msgs/Image topics; 'zmq' = legacy teleimager. "
+                         "Default: dds.")
+    ap.add_argument("--camera-dds-domain", type=int, default=10,
+                    help="Native camera DDS domain; separate from robot domain 0. Default: 10.")
+    ap.add_argument("--camera-network-interface", default=None,
+                    help="Optional NIC name used for native camera DDS discovery.")
     ap.add_argument("--head-eye", choices=["left", "right", "both"], default="left",
                     help="Which head eye(s) to feed to the policy. 'left' or 'right' map to "
                          "video.high; 'both' produces video.left_eye_view + video.right_eye_view. "

@@ -14,14 +14,15 @@
 # Prereqs:
 #   - sharpa_dds_bridge --side both running on Thor
 #   - GR00T policy server reachable at --policy-host:--policy-port (default localhost:5555)
-#   - tv conda env active, ROS 2 (jazzy) sourced
+#   - tv conda env active, native DDS camera publisher running on Thor domain 10
 #   - $INIT_STATE_YAML exists (defaults to ~/init_state.yaml). Generate with:
 #       bash ~/binliu/xr_teleoperate/teleop/utils/run_compute_average_initial_state.sh \
 #            <dataset_dir> -- --output ~/init_state.yaml
 #
 # Override any default by passing the matching flag as an extra argument:
 #   --policy-host, --policy-port, --head-eye, --hold-s, --action-horizon,
-#   --init-state-yaml, --init-state-hold-s, --frequency, --dds-domain, ...
+#   --init-state-yaml, --init-state-hold-s, --frequency, --dds-domain,
+#   --camera-dds-domain, --camera-network-interface, ...
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -55,7 +56,8 @@ python "${SCRIPT_DIR}/eval_h2_groot.py" \
     --motion \
     --head-eye left \
     --hands-source dds \
-    --image-source ros \
+    --image-source dds \
+    --camera-dds-domain 10 \
     --hold-s 20 \
     --action-horizon 15 \
     "${INIT_STATE_ARGS[@]}" \
