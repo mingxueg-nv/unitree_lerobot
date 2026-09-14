@@ -19,5 +19,6 @@ exec bash "${SCRIPT_DIR}/run_eval_h2_groot.sh" "$1" "$2" \
     --policy-format n2 \
     --head-eye right \
     --swap-wrist-cams \
+    --camera-watchdog-timeout-s 0.25 \
     --timeout-ms 60000 \
     "${@:3}"

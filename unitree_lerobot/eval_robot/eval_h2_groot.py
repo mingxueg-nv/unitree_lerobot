@@ -94,6 +94,19 @@ RIGHT_EE_SLICE  = slice(36, 58)
 SHARPA_DOF      = 22
 ARM_DOF         = 14
 
+# ── video key naming per checkpoint ───────────────────────────────────────────
+# Camera roles inside this script are always high / left_wrist_view /
+# right_wrist_view. Checkpoints trained with other names need a rename on the
+# wire; N1.7 servers look the keys up verbatim and raise KeyError otherwise.
+VIDEO_KEY_STYLES: dict[str, dict[str, str]] = {
+    "high_view":  {},   # video.high, video.left_wrist_view, video.right_wrist_view
+    "head_right": {     # gr00t-n1.7-h2-sharpa-trocar-ckpt44200
+        "high":              "head_right",
+        "left_wrist_view":   "wrist_left",
+        "right_wrist_view":  "wrist_right",
+    },
+}
+
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger = logging_mp.getLogger(__name__)
@@ -126,8 +139,10 @@ class GR00TClient:
     Only requires zmq, msgpack, numpy — no gr00t package needed.
     """
 
-    def __init__(self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000):
+    def __init__(self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000,
+                 video_key_map: dict[str, str] | None = None):
         import zmq
+        self._video_key_map = dict(video_key_map or {})
         self._ctx    = zmq.Context()
         self._address = f"tcp://{host}:{port}"
         self._timeout_ms = timeout_ms
@@ -169,11 +184,21 @@ class GR00TClient:
     def reset(self):
         self._send("reset", {"options": None})
 
+    def _apply_video_key_map(self, obs: dict) -> dict:
+        """Rename the camera-role keys to whatever the checkpoint was trained with."""
+        video = obs.get("video")
+        if not self._video_key_map or not isinstance(video, dict):
+            return obs
+        renamed = dict(obs)
+        renamed["video"] = {self._video_key_map.get(k, k): v for k, v in video.items()}
+        return renamed
+
     def get_action(self, obs: dict) -> tuple[dict, dict]:
         """
         obs: nested dict, values are np.ndarray with shape (B, T, ...) or lists of strings.
         Returns (action_chunk, info) where action_chunk values are (B, T, D) arrays.
         """
+        obs = self._apply_video_key_map(obs)
         response = self._send("get_action", {"observation": obs, "options": None})
         if isinstance(response, (list, tuple)) and len(response) == 2:
             return response[0], response[1]
@@ -697,6 +722,34 @@ def _go_home(arm_ctrl, left_hand, right_hand, hold_s: int):
     _countdown(hold_s, "holding home")
 
 
+def _camera_failure_hold(arm_ctrl):
+    """Freeze measured arm pose until the operator enters damping mode.
+
+    Automatically moving home or opening the hands after vision loss can be
+    unsafe near the task scene. Keep publishing a fixed measured arm target,
+    leave the hand targets unchanged, and require explicit operator takeover.
+    """
+    try:
+        hold_q = arm_ctrl.get_current_dual_arm_q().astype(np.float64)
+        arm_ctrl.ctrl_dual_arm(hold_q, np.zeros(ARM_DOF, dtype=np.float64))
+        logger.critical(
+            "CAMERA FAILURE HOLD: policy commands stopped; arms hold the measured "
+            "pose and hand targets remain unchanged. Enter damping mode with the "
+            "remote, then press Ctrl+C once to exit."
+        )
+    except Exception as exc:
+        logger.critical(
+            f"CAMERA FAILURE HOLD could not latch measured arm pose: {exc}. "
+            "Use the remote emergency/damping procedure immediately."
+        )
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        logger.info("Operator ended camera-failure hold.")
+
+
 def _load_init_state_yaml(yaml_path):
     """Load an average-initial-state YAML produced by
     teleop/utils/compute_average_initial_state.py. Returns the nested dict
@@ -805,6 +858,124 @@ def _warm_cameras(img_client, timeout_s: float = 5.0):
         if len(warmed) < len(getters):
             time.sleep(0.05)
     logger.info(f"Cameras warmed: {sorted(warmed)} ({len(warmed)}/{len(getters)})")
+
+
+class CameraSafetyError(RuntimeError):
+    """Raised when a required policy camera stops delivering fresh frames."""
+
+
+class CameraWatchdog:
+    """Monitor fresh frame sequence IDs independently of policy inference.
+
+    DDSImageClient intentionally caches the latest decoded image. Checking only
+    ``frame.bgr is not None`` therefore cannot distinguish a live camera from a
+    publisher that died while an old image remained cached. This watchdog polls
+    the three physical streams used by the policy and requires each sequence ID
+    to keep advancing.
+    """
+
+    def __init__(
+        self,
+        img_client,
+        head_eye: str,
+        timeout_s: float,
+        poll_s: float = 0.02,
+    ):
+        if timeout_s <= 0:
+            raise ValueError("camera watchdog timeout must be positive")
+        if poll_s <= 0:
+            raise ValueError("camera watchdog poll interval must be positive")
+
+        if head_eye == "right" and hasattr(img_client, "get_right_head_frame"):
+            head_name = "head_right"
+            head_getter = img_client.get_right_head_frame
+        elif head_eye == "left" and hasattr(img_client, "get_left_head_frame"):
+            head_name = "head_left"
+            head_getter = img_client.get_left_head_frame
+        else:
+            head_name = "head"
+            head_getter = img_client.get_head_frame
+
+        self._streams = [
+            (head_name, head_getter),
+            ("wrist_left", img_client.get_left_wrist_frame),
+            ("wrist_right", img_client.get_right_wrist_frame),
+        ]
+        self._timeout_s = float(timeout_s)
+        self._poll_s = float(poll_s)
+        self._stop = threading.Event()
+        self._failed = threading.Event()
+        self._failure_lock = threading.Lock()
+        self._failure_message = ""
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="camera-safety-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self._timeout_s + self._poll_s))
+            self._thread = None
+
+    def _fail(self, message: str):
+        with self._failure_lock:
+            if not self._failed.is_set():
+                self._failure_message = message
+                logger.critical(f"CAMERA SAFETY WATCHDOG: {message}")
+                self._failed.set()
+
+    def raise_if_failed(self):
+        if self._failed.is_set():
+            with self._failure_lock:
+                message = self._failure_message
+            raise CameraSafetyError(message)
+
+    def _loop(self):
+        now = time.monotonic()
+        last_sequence = {}
+        last_advance = {name: now for name, _ in self._streams}
+
+        while not self._stop.is_set() and not self._failed.is_set():
+            now = time.monotonic()
+            for name, getter in self._streams:
+                try:
+                    frame = getter()
+                except Exception as exc:
+                    self._fail(f"{name}: frame getter failed: {exc}")
+                    break
+
+                image = None if frame is None else getattr(frame, "bgr", None)
+                if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+                    self._fail(f"{name}: empty or invalid frame")
+                    break
+
+                sequence = getattr(frame, "sequence_id", None)
+                if sequence is None:
+                    self._fail(f"{name}: frame has no sequence_id; freshness cannot be verified")
+                    break
+                sequence = int(sequence)
+                previous = last_sequence.get(name)
+                if previous is None or sequence != previous:
+                    last_sequence[name] = sequence
+                    last_advance[name] = now
+                else:
+                    frozen_s = now - last_advance[name]
+                    if frozen_s > self._timeout_s:
+                        self._fail(
+                            f"{name}: sequence {sequence} has not advanced for "
+                            f"{frozen_s:.3f}s (limit {self._timeout_s:.3f}s)"
+                        )
+                        break
+
+            self._stop.wait(self._poll_s)
 
 
 # ── hand setup / teardown ────────────────────────────────────────────────────
@@ -1089,6 +1260,7 @@ def eval_h2_groot(args):
         host=args.policy_host,
         port=args.policy_port,
         timeout_ms=args.timeout_ms,
+        video_key_map=VIDEO_KEY_STYLES[args.video_key_style],
     )
     for attempt in range(30):
         if client.ping():
@@ -1115,6 +1287,25 @@ def eval_h2_groot(args):
     dt       = 1.0 / args.frequency
     step_dt  = dt  # the chunk's per-step time spacing matches the consumer rate
     episode  = 0
+    camera_watchdog = None
+    if args.camera_watchdog_timeout_s > 0:
+        if args.image_source != "dds":
+            raise ValueError(
+                "--camera-watchdog-timeout-s currently requires --image-source dds"
+            )
+        camera_watchdog = CameraWatchdog(
+            img_client,
+            head_eye=args.head_eye,
+            timeout_s=args.camera_watchdog_timeout_s,
+            poll_s=args.camera_watchdog_poll_s,
+        )
+        camera_watchdog.start()
+        logger.info(
+            "Camera safety watchdog enabled: "
+            f"head_{args.head_eye} + wrist_left + wrist_right, "
+            f"timeout={args.camera_watchdog_timeout_s:.3f}s, "
+            f"poll={args.camera_watchdog_poll_s:.3f}s"
+        )
 
     # ── optional async worker setup ───────────────────────────────────────────
     worker = None
@@ -1129,8 +1320,11 @@ def eval_h2_groot(args):
         worker.start()
         logger.info("Async policy worker started (paused).")
 
+    camera_safety_abort = False
     try:
         while True:
+            if camera_watchdog is not None:
+                camera_watchdog.raise_if_failed()
             episode += 1
             if worker is not None:
                 # Pause worker, reset policy via worker (sole socket owner),
@@ -1170,6 +1364,8 @@ def eval_h2_groot(args):
 
             steps_executed = 0
             while steps_executed < args.steps:
+                if camera_watchdog is not None:
+                    camera_watchdog.raise_if_failed()
                 # ── fetch next chunk ─────────────────────────────────────────
                 if worker is not None:
                     # Wait for the worker to produce a chunk we haven't seen.
@@ -1207,6 +1403,10 @@ def eval_h2_groot(args):
                                            image_source=args.image_source,
                                            swap_wrist_cams=args.swap_wrist_cams)
                     action_chunk, _ = client.get_action(obs)
+                    if camera_watchdog is not None:
+                        # Inference is blocking. A camera may have died while the
+                        # request was running, so re-check before using its action.
+                        camera_watchdog.raise_if_failed()
                     chunk_len = (action_chunk["left_arm"].shape[1]
                                  if "left_arm" in action_chunk else args.action_horizon)
                     start_step = 0
@@ -1255,6 +1455,9 @@ def eval_h2_groot(args):
 
                 # ── walk the chunk for `horizon` ticks (action_horizon or less) ──
                 for offset in range(horizon):
+                    if camera_watchdog is not None:
+                        # This check precedes every arm/hand policy command.
+                        camera_watchdog.raise_if_failed()
                     t = start_step + offset
                     t0 = time.perf_counter()
 
@@ -1385,16 +1588,34 @@ def eval_h2_groot(args):
                 _go_to_init_state(arm_ctrl, left_hand, right_hand, init_state,
                                   hold_s=args.init_state_hold_s)
 
+    except CameraSafetyError as exc:
+        camera_safety_abort = True
+        logger.critical(f"SAFETY STOP: camera stream lost; policy execution aborted: {exc}")
+        if worker is not None:
+            worker.pause()
+        _camera_failure_hold(arm_ctrl)
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
+        if camera_watchdog is not None:
+            try:
+                camera_watchdog.stop()
+            except Exception as e:
+                logger.warning(f"camera watchdog stop failed: {e}")
         if worker is not None:
             try:
                 worker.stop()
             except Exception as e:
                 logger.warning(f"async worker stop failed: {e}")
-        _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
-        _teardown_hands(args, left_hand, right_hand)
+        if camera_safety_abort:
+            logger.critical(
+                "Camera safety abort complete: skipping automatic go-home and hand "
+                "neutral commands. Robot must already be in operator-controlled "
+                "damping mode before this process exits."
+            )
+        else:
+            _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
+            _teardown_hands(args, left_hand, right_hand)
         try:
             img_client.close()
         except Exception:
@@ -1445,8 +1666,19 @@ def parse_args():
                     help="Which head eye(s) to feed to the policy. 'left' or 'right' map to "
                          "video.high; 'both' produces video.left_eye_view + video.right_eye_view. "
                          "Default: left.")
+    ap.add_argument("--video-key-style", choices=sorted(VIDEO_KEY_STYLES), default="high_view",
+                    help="Video key names the N1.7 checkpoint was trained with. 'high_view' "
+                         "sends video.high/left_wrist_view/right_wrist_view; 'head_right' sends "
+                         "video.head_right/wrist_left/wrist_right. N2 ignores this — it reads "
+                         "the names from the checkpoint. Default: high_view.")
     ap.add_argument("--cam-warmup-s", type=float, default=5.0,
                     help="How long to wait for the first frame from each camera (default: 5s).")
+    ap.add_argument("--camera-watchdog-timeout-s", type=float, default=0.0,
+                    help="Safety-stop policy execution if any required DDS camera sequence "
+                         "does not advance for this many seconds. 0 disables. "
+                         "The N2 launcher enables 0.25s by default.")
+    ap.add_argument("--camera-watchdog-poll-s", type=float, default=0.02,
+                    help="Required-camera watchdog polling interval. Default: 0.02s.")
     ap.add_argument("--swap-wrist-cams", action="store_true",
                     help="Swap left/right wrist camera streams. Use this when the physical "
                          "wiring puts the wrist cameras on the wrong sides — fixes the "
