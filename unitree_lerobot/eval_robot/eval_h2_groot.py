@@ -64,6 +64,7 @@ Usage:
 import argparse
 from collections import deque
 import io
+import json
 import math
 import os
 import sys
@@ -93,6 +94,104 @@ LEFT_EE_SLICE   = slice(14, 36)
 RIGHT_EE_SLICE  = slice(36, 58)
 SHARPA_DOF      = 22
 ARM_DOF         = 14
+
+# Optional, data-derived right-hand grip assist. The robust limits come directly
+# from this task's 275 Parquet episodes; the tight reference is the 75th
+# percentile of the top-quartile episodes' tightest 10% frames.
+RIGHT_GRIP_FLEX_INDICES = np.array(
+    [0, 2, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16, 18, 20, 21], dtype=np.int64
+)
+RIGHT_GRIP_ASSIST_INDICES = np.array(
+    [0, 2, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16, 18, 20, 21], dtype=np.int64
+)
+RIGHT_GRIP_DATA_Q01 = np.array(
+    [-0.010086, -0.224762, -0.448843, -0.292790, 0.049835, -0.149491,
+     -0.285544, 0.040267, 0.134379, -0.120019, -0.278353, 0.054019,
+     0.089177, -0.151634, -0.196518, 0.036057, 0.118800, 0.117146,
+     -0.065865, -0.190628, 0.055334, 0.106129],
+    dtype=np.float64,
+)
+RIGHT_GRIP_DATA_Q99 = np.array(
+    [1.436906, 0.254193, 0.746905, 0.250873, 0.396878, 0.820181,
+     0.080465, 0.284368, 0.576840, 0.838638, 0.057478, 0.371396,
+     0.685116, 1.091048, 0.019280, 0.569340, 1.310820, 0.178420,
+     1.084540, 0.001880, 0.654376, 1.310549],
+    dtype=np.float64,
+)
+RIGHT_GRIP_TIGHT_REFERENCE = np.array(
+    [0.970855, -0.059733, 0.657004, 0.175105, 0.264262, 0.759542,
+     -0.234731, 0.161338, 0.474259, 0.777466, -0.267898, 0.215217,
+     0.550285, 1.007525, -0.098707, 0.430902, 1.308348, 0.170494,
+     0.945218, -0.081950, 0.496444, 1.309591],
+    dtype=np.float64,
+)
+RIGHT_GRIP_ASSIST_STRENGTH = 0.50
+RIGHT_GRIP_ASSIST_MAX_DELTA_RAD = 0.10
+RIGHT_GRIP_ASSIST_DELTA_SLEW_RAD = 0.01
+RIGHT_GRIP_GATE_START = 0.40
+RIGHT_GRIP_GATE_FULL = 0.55
+
+
+class HandCommandSafetyError(RuntimeError):
+    """Raised before DDS send when an assisted hand target is invalid."""
+
+
+def _apply_right_hand_grip_assist(
+    target,
+    previous_delta,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Conservatively move selected flexion joints toward demonstrated tight grip."""
+    q = np.asarray(target, dtype=np.float64)
+    if q.shape != (SHARPA_DOF,) or not np.all(np.isfinite(q)):
+        raise HandCommandSafetyError(
+            f"invalid right-hand target: shape={q.shape}, finite={np.all(np.isfinite(q))}"
+        )
+
+    data_range = RIGHT_GRIP_DATA_Q99 - RIGHT_GRIP_DATA_Q01
+    safety_low = RIGHT_GRIP_DATA_Q01 - 0.25 * data_range
+    safety_high = RIGHT_GRIP_DATA_Q99 + 0.25 * data_range
+    outside = np.flatnonzero((q < safety_low) | (q > safety_high))
+    if outside.size:
+        raise HandCommandSafetyError(
+            "right-hand model target outside demonstrated safety envelope at "
+            f"indices={outside.tolist()}"
+        )
+
+    flex = RIGHT_GRIP_FLEX_INDICES
+    score = float(np.mean(
+        (q[flex] - RIGHT_GRIP_DATA_Q01[flex])
+        / (RIGHT_GRIP_DATA_Q99[flex] - RIGHT_GRIP_DATA_Q01[flex])
+    ))
+    gate = float(np.clip(
+        (score - RIGHT_GRIP_GATE_START)
+        / (RIGHT_GRIP_GATE_FULL - RIGHT_GRIP_GATE_START),
+        0.0,
+        1.0,
+    ))
+
+    desired_delta = np.zeros(SHARPA_DOF, dtype=np.float64)
+    idx = RIGHT_GRIP_ASSIST_INDICES
+    desired_delta[idx] = gate * np.clip(
+        RIGHT_GRIP_ASSIST_STRENGTH * (RIGHT_GRIP_TIGHT_REFERENCE[idx] - q[idx]),
+        0.0,
+        RIGHT_GRIP_ASSIST_MAX_DELTA_RAD,
+    )
+    prev = np.asarray(previous_delta, dtype=np.float64)
+    delta = prev + np.clip(
+        desired_delta - prev,
+        -RIGHT_GRIP_ASSIST_DELTA_SLEW_RAD,
+        RIGHT_GRIP_ASSIST_DELTA_SLEW_RAD,
+    )
+    # Never reduce the model target, and never let the assist itself push a
+    # joint above the raw dataset's q99. If the model is already above q99,
+    # preserve it unchanged rather than clipping it downward.
+    applied_delta = np.zeros(SHARPA_DOF, dtype=np.float64)
+    applied_delta[idx] = np.minimum(
+        delta[idx],
+        np.maximum(RIGHT_GRIP_DATA_Q99[idx] - q[idx], 0.0),
+    )
+    assisted = q + applied_delta
+    return assisted, applied_delta, score
 
 # ── video key naming per checkpoint ───────────────────────────────────────────
 # Camera roles inside this script are always high / left_wrist_view /
@@ -677,6 +776,145 @@ def read_hand_state(hand) -> np.ndarray:
         return np.array([math.radians(a) for a in angles_deg[:SHARPA_DOF]], dtype=np.float32)
     except Exception:
         return np.zeros(SHARPA_DOF, dtype=np.float32)
+
+
+def _hand_diagnostic_snapshot(hand) -> tuple[np.ndarray, int, float]:
+    """Return (joint radians, DDS sequence, DDS age seconds) without commanding."""
+    if hand is None:
+        return np.full(SHARPA_DOF, np.nan), -1, math.inf
+    if hasattr(hand, "get_state_diagnostics"):
+        snapshot = hand.get_state_diagnostics()
+        positions = np.asarray(snapshot["positions_rad"], dtype=np.float64)
+        if positions.size != SHARPA_DOF:
+            padded = np.full(SHARPA_DOF, np.nan)
+            padded[:min(positions.size, SHARPA_DOF)] = positions[:SHARPA_DOF]
+            positions = padded
+        return (
+            positions,
+            int(snapshot["sequence_id"]),
+            float(snapshot["age_s"]),
+        )
+    return read_hand_state(hand).astype(np.float64), -1, math.nan
+
+
+class EvalDiagnosticsRecorder:
+    """Save synchronized 58-DoF targets/feedback and hand DDS freshness."""
+
+    def __init__(self, output_dir: str, args):
+        self.output_dir = os.path.abspath(os.path.expanduser(output_dir))
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.run_id = time.strftime("%Y%m%d-%H%M%S")
+        self.metadata_json = json.dumps(
+            {
+                "task": args.task,
+                "frequency_hz": args.frequency,
+                "action_horizon": args.action_horizon,
+                "policy_format": args.policy_format,
+                "hands_source": args.hands_source,
+                "right_hand_grip_assist": args.right_hand_grip_assist,
+                "right_hand_grip_assist_strength": RIGHT_GRIP_ASSIST_STRENGTH,
+                "right_hand_grip_assist_max_delta_rad": RIGHT_GRIP_ASSIST_MAX_DELTA_RAD,
+                "layout": "left_arm[0:7],right_arm[7:14],left_hand[14:36],right_hand[36:58]",
+                "units": "radians",
+            },
+            sort_keys=True,
+        )
+        self.episode = None
+        self.rows = None
+
+    def start_episode(self, episode: int):
+        if self.rows:
+            self.save_episode("aborted_before_next_episode")
+        self.episode = int(episode)
+        self.rows = {
+            "wall_time_ns": [],
+            "monotonic_s": [],
+            "episode_step": [],
+            "chunk_index": [],
+            "chunk_step": [],
+            "model_output_58_rad": [],
+            "target_58_rad": [],
+            "state_before_58_rad": [],
+            "state_after_58_rad": [],
+            "left_sequence_before": [],
+            "right_sequence_before": [],
+            "left_sequence_after": [],
+            "right_sequence_after": [],
+            "left_age_before_s": [],
+            "right_age_before_s": [],
+            "left_age_after_s": [],
+            "right_age_after_s": [],
+            "right_grip_assist_score": [],
+            "right_grip_assist_delta_rad": [],
+        }
+
+    def record(
+        self,
+        *,
+        episode_step: int,
+        chunk_index: int,
+        chunk_step: int,
+        model_output_58,
+        target_58,
+        state_before_58,
+        state_after_58,
+        left_freshness_before,
+        right_freshness_before,
+        left_freshness_after,
+        right_freshness_after,
+        right_grip_assist_score,
+        right_grip_assist_delta,
+    ):
+        if self.rows is None:
+            return
+        self.rows["wall_time_ns"].append(time.time_ns())
+        self.rows["monotonic_s"].append(time.monotonic())
+        self.rows["episode_step"].append(int(episode_step))
+        self.rows["chunk_index"].append(int(chunk_index))
+        self.rows["chunk_step"].append(int(chunk_step))
+        self.rows["model_output_58_rad"].append(
+            np.asarray(model_output_58, dtype=np.float64)
+        )
+        self.rows["target_58_rad"].append(np.asarray(target_58, dtype=np.float64))
+        self.rows["state_before_58_rad"].append(np.asarray(state_before_58, dtype=np.float64))
+        self.rows["state_after_58_rad"].append(np.asarray(state_after_58, dtype=np.float64))
+        self.rows["right_grip_assist_score"].append(float(right_grip_assist_score))
+        self.rows["right_grip_assist_delta_rad"].append(
+            np.asarray(right_grip_assist_delta, dtype=np.float64)
+        )
+        for side, before, after in (
+            ("left", left_freshness_before, left_freshness_after),
+            ("right", right_freshness_before, right_freshness_after),
+        ):
+            self.rows[f"{side}_sequence_before"].append(before[1])
+            self.rows[f"{side}_age_before_s"].append(before[2])
+            self.rows[f"{side}_sequence_after"].append(after[1])
+            self.rows[f"{side}_age_after_s"].append(after[2])
+
+    def save_episode(self, status: str):
+        if self.rows is None or self.episode is None:
+            return None
+        if not self.rows["episode_step"]:
+            self.rows = None
+            self.episode = None
+            return None
+
+        episode = self.episode
+        path = os.path.join(
+            self.output_dir,
+            f"hand_diag_{self.run_id}_ep{episode:03d}_{status}.npz",
+        )
+        payload = {key: np.asarray(value) for key, value in self.rows.items()}
+        payload["status"] = np.asarray(status)
+        payload["metadata_json"] = np.asarray(self.metadata_json)
+        np.savez_compressed(path, **payload)
+        logger.info(
+            f"58-DoF eval diagnostics saved: {path} "
+            f"({len(payload['episode_step'])} control ticks, status={status})"
+        )
+        self.rows = None
+        self.episode = None
+        return path
 
 
 # ── Sharpa hand helpers — DDS bridge path ────────────────────────────────────
@@ -1320,7 +1558,24 @@ def eval_h2_groot(args):
         worker.start()
         logger.info("Async policy worker started (paused).")
 
-    camera_safety_abort = False
+    diagnostics = None
+    if args.eval_diagnostics_dir:
+        if not args.arm or not args.hands:
+            raise ValueError("--eval-diagnostics-dir requires both arms and hands enabled")
+        diagnostics = EvalDiagnosticsRecorder(args.eval_diagnostics_dir, args)
+        logger.info(
+            "58-DoF eval diagnostics enabled: "
+            f"{diagnostics.output_dir}"
+        )
+    if args.right_hand_grip_assist:
+        logger.info(
+            "Right-hand grip assist enabled: data-derived per-joint reference, "
+            f"strength={RIGHT_GRIP_ASSIST_STRENGTH:.2f}, "
+            f"max_delta={RIGHT_GRIP_ASSIST_MAX_DELTA_RAD:.3f}rad, "
+            f"delta_slew={RIGHT_GRIP_ASSIST_DELTA_SLEW_RAD:.3f}rad/tick"
+        )
+
+    latched_safety_abort = None
     try:
         while True:
             if camera_watchdog is not None:
@@ -1335,6 +1590,8 @@ def eval_h2_groot(args):
             else:
                 client.reset()
             logger.info(f"\n=== Episode {episode} ===")
+            if diagnostics is not None:
+                diagnostics.start_episode(episode)
 
             # EMA state on the per-step action targets. Smooths high-frequency
             # noise from the policy output (visible as arm/hand jitter).
@@ -1351,7 +1608,9 @@ def eval_h2_groot(args):
             prev_right_arm = None
             prev_left_hand = None
             prev_right_hand = None
+            right_grip_assist_delta = np.zeros(SHARPA_DOF, dtype=np.float64)
             last_loaded_version = -1
+            chunk_index = 0
             # Counter — how many remaining boundary-smoothing ticks for the
             # current chunk. Reset to boundary_total on every chunk switch.
             boundary_remaining = 0
@@ -1422,6 +1681,7 @@ def eval_h2_groot(args):
                     )
                     continue
 
+                chunk_index += 1
                 # New chunk just loaded → restart boundary-smoothing window.
                 # (Only meaningful if prev_* is set; the very first chunk has
                 # no anchor so EMA passes through raw values regardless.)
@@ -1505,9 +1765,20 @@ def eval_h2_groot(args):
                     prev_left_arm = left_arm
                     prev_right_arm = right_arm
 
+                    if diagnostics is not None:
+                        arm_state_before = arm_ctrl.get_current_dual_arm_q().astype(np.float64)
+                        left_freshness_before = _hand_diagnostic_snapshot(left_hand)
+                        right_freshness_before = _hand_diagnostic_snapshot(right_hand)
+
                     arm_q_target = np.concatenate([left_arm, right_arm])
                     arm_ctrl.ctrl_dual_arm(arm_q_target, np.zeros(ARM_DOF, dtype=np.float64))
 
+                    left_hand_target = np.full(SHARPA_DOF, np.nan)
+                    right_hand_target = np.full(SHARPA_DOF, np.nan)
+                    right_grip_assist_score = math.nan
+                    applied_right_grip_assist_delta = np.zeros(
+                        SHARPA_DOF, dtype=np.float64
+                    )
                     if args.hands:
                         if left_hand is not None and "left_hand" in action_chunk:
                             if offset < blend_window and "left_hand" in (prev_chunk or {}):
@@ -1523,6 +1794,7 @@ def eval_h2_groot(args):
                             else:
                                 lh = raw_lh
                             prev_left_hand = lh
+                            left_hand_target = np.asarray(lh, dtype=np.float64)
                             err = left_hand.set_joint_position(lh.tolist(), False)
                             # DDS client returns None; SDK returns Error obj.
                             if err is not None and getattr(err, "code", 0) != 0:
@@ -1541,12 +1813,67 @@ def eval_h2_groot(args):
                             else:
                                 rh = raw_rh
                             prev_right_hand = rh
-                            err = right_hand.set_joint_position(rh.tolist(), False)
+                            right_hand_target = np.asarray(rh, dtype=np.float64)
+                            if args.right_hand_grip_assist:
+                                (
+                                    right_hand_target,
+                                    right_grip_assist_delta,
+                                    right_grip_assist_score,
+                                ) = _apply_right_hand_grip_assist(
+                                    right_hand_target,
+                                    right_grip_assist_delta,
+                                )
+                                applied_right_grip_assist_delta = (
+                                    right_grip_assist_delta.copy()
+                                )
+                            err = right_hand.set_joint_position(
+                                right_hand_target.tolist(), False
+                            )
                             if err is not None and getattr(err, "code", 0) != 0:
                                 logger.warning(f"right hand error t={t}: {err.message}")
 
                     elapsed = time.perf_counter() - t0
                     time.sleep(max(0.0, dt - elapsed))
+                    if diagnostics is not None:
+                        arm_state_after = arm_ctrl.get_current_dual_arm_q().astype(np.float64)
+                        left_freshness_after = _hand_diagnostic_snapshot(left_hand)
+                        right_freshness_after = _hand_diagnostic_snapshot(right_hand)
+                        diagnostics.record(
+                            episode_step=steps_executed,
+                            chunk_index=chunk_index,
+                            chunk_step=t,
+                            model_output_58=np.concatenate(
+                                [
+                                    np.asarray(action_chunk["left_arm"][0][t], dtype=np.float64),
+                                    np.asarray(action_chunk["right_arm"][0][t], dtype=np.float64),
+                                    np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64),
+                                    np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64),
+                                ]
+                            ),
+                            target_58=np.concatenate(
+                                [arm_q_target, left_hand_target, right_hand_target]
+                            ),
+                            state_before_58=np.concatenate(
+                                [
+                                    arm_state_before,
+                                    left_freshness_before[0],
+                                    right_freshness_before[0],
+                                ]
+                            ),
+                            state_after_58=np.concatenate(
+                                [
+                                    arm_state_after,
+                                    left_freshness_after[0],
+                                    right_freshness_after[0],
+                                ]
+                            ),
+                            left_freshness_before=left_freshness_before,
+                            right_freshness_before=right_freshness_before,
+                            left_freshness_after=left_freshness_after,
+                            right_freshness_after=right_freshness_after,
+                            right_grip_assist_score=right_grip_assist_score,
+                            right_grip_assist_delta=applied_right_grip_assist_delta,
+                        )
                     if isinstance(client, GR00TN2Client):
                         # N2 needs observations from the actual 30 Hz control
                         # timeline, not only one frame at each inference boundary.
@@ -1582,6 +1909,8 @@ def eval_h2_groot(args):
             if worker is not None:
                 worker.pause()
 
+            if diagnostics is not None:
+                diagnostics.save_episode("complete")
             logger.info(f"Episode {episode} complete ({args.steps} steps). Going home...")
             _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
             if init_state is not None:
@@ -1589,14 +1918,28 @@ def eval_h2_groot(args):
                                   hold_s=args.init_state_hold_s)
 
     except CameraSafetyError as exc:
-        camera_safety_abort = True
+        latched_safety_abort = "camera"
         logger.critical(f"SAFETY STOP: camera stream lost; policy execution aborted: {exc}")
         if worker is not None:
             worker.pause()
+        if diagnostics is not None:
+            diagnostics.save_episode("camera_safety_abort")
+        _camera_failure_hold(arm_ctrl)
+    except HandCommandSafetyError as exc:
+        latched_safety_abort = "right_hand_command"
+        logger.critical(f"SAFETY STOP: invalid right-hand command; execution aborted: {exc}")
+        if worker is not None:
+            worker.pause()
+        if diagnostics is not None:
+            diagnostics.save_episode("hand_command_safety_abort")
         _camera_failure_hold(arm_ctrl)
     except KeyboardInterrupt:
+        if diagnostics is not None:
+            diagnostics.save_episode("interrupted")
         logger.info("Stopped by user.")
     finally:
+        if diagnostics is not None:
+            diagnostics.save_episode("aborted")
         if camera_watchdog is not None:
             try:
                 camera_watchdog.stop()
@@ -1607,11 +1950,11 @@ def eval_h2_groot(args):
                 worker.stop()
             except Exception as e:
                 logger.warning(f"async worker stop failed: {e}")
-        if camera_safety_abort:
+        if latched_safety_abort is not None:
             logger.critical(
-                "Camera safety abort complete: skipping automatic go-home and hand "
-                "neutral commands. Robot must already be in operator-controlled "
-                "damping mode before this process exits."
+                f"{latched_safety_abort} safety abort complete: skipping automatic "
+                "go-home and hand neutral commands. Robot must already be in "
+                "operator-controlled damping mode before this process exits."
             )
         else:
             _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
@@ -1692,6 +2035,17 @@ def parse_args():
                          "Default: dds.")
     ap.add_argument("--dds-domain", type=int, default=0,
                     help="DDS domain ID for the arm controller and DDS-bridge hand client.")
+    ap.add_argument("--eval-diagnostics-dir", type=str, default=None,
+                    help="Write one compressed NPZ per episode with synchronized 58-DoF "
+                         "targets/states plus hand DDS freshness. Disabled by default.")
+    ap.add_argument(
+        "--right-hand-grip-assist",
+        action="store_true",
+        help="Slightly tighten selected right-hand flexion joints using a conservative "
+             "reference derived from the top-quartile training demonstrations. Includes "
+             "finite/range checks, a 0.10-rad assist cap, and 0.01-rad/tick slew limit. "
+             "Disabled by default; omitting this flag preserves the previous command path.",
+    )
 
     # H2 motion mode for standing replay (publish to rt/arm_sdk so WBC yields arms).
     ap.add_argument("--motion", action="store_true",
