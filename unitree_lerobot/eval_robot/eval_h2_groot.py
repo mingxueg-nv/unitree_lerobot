@@ -811,6 +811,7 @@ class EvalDiagnosticsRecorder:
                 "action_horizon": args.action_horizon,
                 "policy_format": args.policy_format,
                 "hands_source": args.hands_source,
+                "black_wrist": args.black_wrist,
                 "right_hand_grip_assist": args.right_hand_grip_assist,
                 "right_hand_grip_assist_strength": RIGHT_GRIP_ASSIST_STRENGTH,
                 "right_hand_grip_assist_max_delta_rad": RIGHT_GRIP_ASSIST_MAX_DELTA_RAD,
@@ -1277,7 +1278,8 @@ def _split_head_image(stitched: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def get_observations(img_client, arm_ctrl, left_hand, right_hand,
                      cam_config, task: str, head_eye: str = "left",
                      image_source: str = "ros",
-                     swap_wrist_cams: bool = False) -> dict:
+                     swap_wrist_cams: bool = False,
+                     black_wrist: bool = False) -> dict:
     """Build the nested GR00T observation dict (before adding batch/time dims)."""
     video: dict[str, np.ndarray] = {}
 
@@ -1332,6 +1334,14 @@ def get_observations(img_client, arm_ctrl, left_hand, right_hand,
             frame = getter()
             if frame is not None and frame.bgr is not None:
                 video[key] = frame.bgr[:, :, ::-1].copy()
+
+    # Wrist-camera ablation for N2 evaluation. Keep acquiring the real streams
+    # so startup checks and the camera watchdog still detect camera failures,
+    # but replace only the policy-facing wrist observations with black images.
+    if black_wrist:
+        for key in ("left_wrist_view", "right_wrist_view"):
+            if key in video:
+                video[key] = np.zeros_like(video[key])
 
     arm_q = arm_ctrl.get_current_dual_arm_q().astype(np.float32)
     state = {
@@ -1392,7 +1402,8 @@ def check_observations(args):
                            cam_config, args.task,
                            head_eye=args.head_eye,
                            image_source=args.image_source,
-                           swap_wrist_cams=args.swap_wrist_cams)
+                           swap_wrist_cams=args.swap_wrist_cams,
+                           black_wrist=args.black_wrist)
 
     def _print_nested(d: dict, prefix: str = ""):
         for k, v in d.items():
@@ -1490,6 +1501,11 @@ def eval_h2_groot(args):
             f"left_wrist_view <- {left_wrist_source}, "
             f"right_wrist_view <- {right_wrist_source}"
         )
+    if args.black_wrist:
+        logger.info(
+            "Wrist-camera ablation enabled: policy receives original head image "
+            "+ black left/right wrist images; real wrist streams remain monitored."
+        )
 
     # ── GR00T policy client ───────────────────────────────────────────────────
     logger.info(f"Connecting to GR00T server at {args.policy_host}:{args.policy_port} ...")
@@ -1553,7 +1569,8 @@ def eval_h2_groot(args):
                                     cam_config, args.task,
                                     head_eye=args.head_eye,
                                     image_source=args.image_source,
-                                    swap_wrist_cams=args.swap_wrist_cams)
+                                    swap_wrist_cams=args.swap_wrist_cams,
+                                    black_wrist=args.black_wrist)
         worker = AsyncPolicyWorker(client, _obs_capture_fn)
         worker.start()
         logger.info("Async policy worker started (paused).")
@@ -1660,7 +1677,8 @@ def eval_h2_groot(args):
                                            cam_config, args.task,
                                            head_eye=args.head_eye,
                                            image_source=args.image_source,
-                                           swap_wrist_cams=args.swap_wrist_cams)
+                                           swap_wrist_cams=args.swap_wrist_cams,
+                                           black_wrist=args.black_wrist)
                     action_chunk, _ = client.get_action(obs)
                     if camera_watchdog is not None:
                         # Inference is blocking. A camera may have died while the
@@ -1888,6 +1906,7 @@ def eval_h2_groot(args):
                                 head_eye=args.head_eye,
                                 image_source=args.image_source,
                                 swap_wrist_cams=args.swap_wrist_cams,
+                                black_wrist=args.black_wrist,
                             )
                         )
                     steps_executed += 1
@@ -2026,6 +2045,13 @@ def parse_args():
                     help="Swap left/right wrist camera streams. Use this when the physical "
                          "wiring puts the wrist cameras on the wrong sides — fixes the "
                          "observation at the eval-script layer without re-recording.")
+    ap.add_argument(
+        "--black_wrist",
+        action="store_true",
+        help="Replace both policy-facing wrist-camera observations with same-shape all-zero "
+             "images while keeping the selected head image unchanged. Real wrist streams "
+             "are still acquired and monitored. Disabled by default.",
+    )
 
     # Sharpa hands source: through the C++ DDS bridge on Thor or direct SDK locally.
     ap.add_argument("--hands-source", choices=["dds", "sdk"], default="dds",
