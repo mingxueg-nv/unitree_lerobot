@@ -132,6 +132,74 @@ RIGHT_GRIP_GATE_START = 0.40
 RIGHT_GRIP_GATE_FULL = 0.55
 
 
+H2_ARM_JOINT_NAMES = [
+    f"{side}_{joint}_joint"
+    for side in ("left", "right")
+    for joint in (
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+        "wrist_roll", "wrist_pitch", "wrist_yaw",
+    )
+]
+# ~1.1x the largest |G(q)| over the full URDF joint range (22.4/20.6/9.7/9.0/
+# 2.1/2.6/2.1 Nm). A correct model never reaches it; it only caps a bad model.
+ARM_GRAVITY_TAU_LIMIT_NM = np.array([25.0, 23.0, 11.0, 10.0, 3.0, 3.0, 3.0] * 2)
+
+
+class H2ArmGravityModel:
+    """G(q) for the 14 arm joints, same reduced model teleop's H2_ArmIK uses.
+
+    Non-arm joints (waist, legs, head, fingers) are locked at 0, so the torque
+    assumes an upright torso exactly like during teleop data collection.
+    """
+
+    def __init__(self, urdf_path: str):
+        import pinocchio as pin
+
+        full = pin.buildModelFromUrdf(urdf_path)
+        lock = [
+            jid for jid in range(1, full.njoints)
+            if full.joints[jid].nq > 0 and full.names[jid] not in H2_ARM_JOINT_NAMES
+        ]
+        self._model = pin.buildReducedModel(full, lock, np.zeros(full.nq))
+        names = [self._model.names[jid] for jid in range(1, self._model.njoints)]
+        if names != H2_ARM_JOINT_NAMES:
+            raise RuntimeError(
+                f"{urdf_path}: reduced arm joints {names} do not match the "
+                f"H2_JointArmIndex order {H2_ARM_JOINT_NAMES}"
+            )
+        self._data = self._model.createData()
+        self._pin = pin
+        self.urdf_path = urdf_path
+
+    def __call__(self, q) -> np.ndarray:
+        q = np.asarray(q, dtype=np.float64).reshape(ARM_DOF)
+        return np.array(
+            self._pin.computeGeneralizedGravity(self._model, self._data, q),
+            dtype=np.float64,
+        )
+
+
+def _enable_arm_gravity_comp(arm_ctrl, args):
+    urdf_path = args.gravity_urdf or os.path.join(
+        _XR_ROOT, "assets", "h2", "H2_with_sharpa_hands.urdf"
+    )
+    gravity = H2ArmGravityModel(urdf_path)
+    waist_q = arm_ctrl.get_current_waist_q()
+    if np.max(np.abs(waist_q)) > 0.1:
+        logger.warning(
+            f"Waist is at {np.round(waist_q, 3).tolist()} rad; gravity compensation "
+            "assumes an upright torso (waist = 0), as during teleop collection."
+        )
+    tau_now = gravity(arm_ctrl.get_current_dual_arm_q())
+    logger.info(
+        f"Arm gravity compensation: URDF={urdf_path}, ramp={args.gravity_comp_ramp_s:.1f}s, "
+        f"G(current q)={np.round(tau_now, 2).tolist()} Nm"
+    )
+    arm_ctrl.enable_gravity_compensation(
+        gravity, ARM_GRAVITY_TAU_LIMIT_NM, ramp_s=args.gravity_comp_ramp_s
+    )
+
+
 class HandCommandSafetyError(RuntimeError):
     """Raised before DDS send when an assisted hand target is invalid."""
 
@@ -804,9 +872,11 @@ class EvalDiagnosticsRecorder:
         self.output_dir = os.path.abspath(os.path.expanduser(output_dir))
         os.makedirs(self.output_dir, exist_ok=True)
         self.run_id = time.strftime("%Y%m%d-%H%M%S")
+        self.record_gravity_tau = bool(args.gravity_comp)
         self.metadata_json = json.dumps(
             {
                 "task": args.task,
+                "gravity_comp": bool(args.gravity_comp),
                 "frequency_hz": args.frequency,
                 "action_horizon": args.action_horizon,
                 "policy_format": args.policy_format,
@@ -848,6 +918,8 @@ class EvalDiagnosticsRecorder:
             "right_grip_assist_score": [],
             "right_grip_assist_delta_rad": [],
         }
+        if self.record_gravity_tau:
+            self.rows["arm_gravity_tau_14_nm"] = []
 
     def record(
         self,
@@ -865,9 +937,14 @@ class EvalDiagnosticsRecorder:
         right_freshness_after,
         right_grip_assist_score,
         right_grip_assist_delta,
+        arm_gravity_tau=None,
     ):
         if self.rows is None:
             return
+        if self.record_gravity_tau:
+            self.rows["arm_gravity_tau_14_nm"].append(
+                np.asarray(arm_gravity_tau, dtype=np.float64)
+            )
         self.rows["wall_time_ns"].append(time.time_ns())
         self.rows["monotonic_s"].append(time.monotonic())
         self.rows["episode_step"].append(int(episode_step))
@@ -1477,6 +1554,8 @@ def eval_h2_groot(args):
         )
         arm_ctrl.speed_gradual_max()
         logger.info("H2_ArmController ready.")
+        if args.gravity_comp:
+            _enable_arm_gravity_comp(arm_ctrl, args)
 
     # Optional: load the average initial state YAML so the robot starts each
     # episode from the same posture distribution the policy saw during training.
@@ -1891,6 +1970,7 @@ def eval_h2_groot(args):
                             right_freshness_after=right_freshness_after,
                             right_grip_assist_score=right_grip_assist_score,
                             right_grip_assist_delta=applied_right_grip_assist_delta,
+                            arm_gravity_tau=arm_ctrl.get_gravity_tau(),
                         )
                     if isinstance(client, GR00TN2Client):
                         # N2 needs observations from the actual 30 Hz control
@@ -2072,6 +2152,21 @@ def parse_args():
              "finite/range checks, a 0.10-rad assist cap, and 0.01-rad/tick slew limit. "
              "Disabled by default; omitting this flag preserves the previous command path.",
     )
+    ap.add_argument(
+        "--gravity-comp", "--gravity",
+        dest="gravity_comp",
+        action="store_true",
+        help="Add pinocchio G(q) arm torque feedforward, as teleop data collection does. "
+             "Evaluated every 250 Hz tick on the published arm command, ramped in, "
+             "clamped per joint, and active through home/init/policy/hold. Disabled by "
+             "default; omitting this flag keeps tau = 0.",
+    )
+    ap.add_argument("--gravity-comp-ramp-s", type=float, default=2.0,
+                    help="Seconds to ramp gravity feedforward from 0 to full. Default: 2.0.")
+    ap.add_argument("--gravity-urdf", type=str, default=None,
+                    help="URDF for gravity compensation. Default: "
+                         "$XR_TELEOPERATE_ROOT/assets/h2/H2_with_sharpa_hands.urdf "
+                         "(the one teleop's H2_ArmIK uses).")
 
     # H2 motion mode for standing replay (publish to rt/arm_sdk so WBC yields arms).
     ap.add_argument("--motion", action="store_true",
